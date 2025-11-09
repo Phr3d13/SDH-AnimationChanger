@@ -16,38 +16,94 @@ CONFIG_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR, 'config.json'
 ANIMATIONS_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_RUNTIME_DIR, 'animations')
 DOWNLOADS_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_RUNTIME_DIR, 'downloads')
 
-# Detect platform and set appropriate Steam override path
-def get_steam_override_path():
+# Detect platform and set appropriate Steam paths
+def get_steam_paths():
+    """Returns tuple of (override_path, steamui_movies_path, steam_root)"""
     system = platform.system()
+    steam_root = None
+    
     if system == 'Linux':
-        return os.path.expanduser('~/.steam/root/config/uioverrides/movies')
+        steam_root = os.path.expanduser('~/.steam/root')
+        override_path = os.path.join(steam_root, 'config', 'uioverrides', 'movies')
+        steamui_path = os.path.join(steam_root, 'steamui', 'movies')
+        return (override_path, steamui_path, steam_root)
+        
     elif system == 'Windows':
-        # Try common Steam installation locations on Windows
-        possible_paths = [
-            os.path.expanduser('~\\AppData\\Local\\Steam\\config\\uioverrides\\movies'),
-            'C:\\Program Files (x86)\\Steam\\config\\uioverrides\\movies',
-            'C:\\Program Files\\Steam\\config\\uioverrides\\movies'
-        ]
-        # Check if Steam is installed via registry or common paths
-        for path in possible_paths:
-            parent = os.path.dirname(path)
-            if os.path.exists(parent):
-                return path
-        # Default to user's local AppData
-        return os.path.expanduser('~\\AppData\\Local\\Steam\\config\\uioverrides\\movies')
+        # Try to get Steam path from Windows registry
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam')
+            steam_path, _ = winreg.QueryValueEx(key, 'SteamPath')
+            winreg.CloseKey(key)
+            steam_root = steam_path.replace('/', '\\')
+        except:
+            # Fallback to common Steam installation locations
+            possible_roots = [
+                'C:\\Program Files (x86)\\Steam',
+                'C:\\Program Files\\Steam',
+            ]
+            for root in possible_roots:
+                if os.path.exists(root):
+                    steam_root = root
+                    break
+        
+        if steam_root:
+            override_path = os.path.join(steam_root, 'config', 'uioverrides', 'movies')
+            steamui_path = os.path.join(steam_root, 'steamui', 'movies')
+            return (override_path, steamui_path, steam_root)
+            
     else:
-        # Fallback for other platforms (macOS, etc.)
-        return os.path.expanduser('~/Library/Application Support/Steam/config/uioverrides/movies')
+        # macOS fallback
+        steam_root = os.path.expanduser('~/Library/Application Support/Steam')
+        override_path = os.path.join(steam_root, 'config', 'uioverrides', 'movies')
+        steamui_path = os.path.join(steam_root, 'steamui', 'movies')
+        return (override_path, steamui_path, steam_root)
+    
+    # Ultimate fallback
+    return (None, None, None)
 
-OVERRIDE_PATH = get_steam_override_path()
+OVERRIDE_PATH, STEAMUI_MOVIES_PATH, STEAM_ROOT = get_steam_paths()
 
-BOOT_VIDEO = 'deck_startup.webm'
-SUSPEND_VIDEO = 'steam_os_suspend.webm'
-THROBBER_VIDEO = 'steam_os_suspend_from_throbber.webm'
+# Platform-specific video filenames
+def get_video_names():
+    if platform.system() == 'Windows':
+        # Windows Steam Big Picture mode
+        return {
+            'boot': 'bigpicture_startup.webm',
+            # Stubs for potential future Windows suspend animation support
+            # If Steam adds these in the future, uncomment and update the is_video_supported() function
+            'suspend': 'bigpicture_suspend.webm',  # Future: not yet implemented by Steam
+            'throbber': 'bigpicture_suspend_from_throbber.webm'  # Future: not yet implemented by Steam
+        }
+    else:
+        # Linux/SteamOS uses deck animations
+        return {
+            'boot': 'deck_startup.webm',
+            'suspend': 'steam_os_suspend.webm',
+            'throbber': 'steam_os_suspend_from_throbber.webm'
+        }
+
+VIDEO_NAMES_MAP = get_video_names()
+BOOT_VIDEO = VIDEO_NAMES_MAP['boot']
+SUSPEND_VIDEO = VIDEO_NAMES_MAP['suspend']
+THROBBER_VIDEO = VIDEO_NAMES_MAP['throbber']
 
 VIDEOS_NAMES = [BOOT_VIDEO, SUSPEND_VIDEO, THROBBER_VIDEO]
 VIDEO_TYPES = ['boot', 'suspend', 'throbber']
 VIDEO_TARGETS = ['boot', 'suspend', 'suspend']
+
+# Track which video types are actually used per platform
+def is_video_supported(video_type):
+    """Check if a video type is supported on current platform"""
+    if platform.system() == 'Windows':
+        # Windows Big Picture currently only supports boot animation
+        # TODO: If Steam adds suspend/throbber support on Windows in the future,
+        # update this function to return True for those types and ensure the
+        # corresponding filenames exist in steamui/movies
+        # For now, only boot animations work
+        return video_type == 'boot'
+    # Linux/SteamOS supports all types
+    return True
 
 REQUEST_RETRIES = 5
 
@@ -233,16 +289,53 @@ def find_cached_animation(anim_id):
 
 
 def apply_animation(video, anim_id):
-    override_path = os.path.join(OVERRIDE_PATH, video)
+    # Check which video type this is
+    video_type = None
+    for i, vname in enumerate(VIDEOS_NAMES):
+        if vname == video:
+            video_type = VIDEO_TYPES[i]
+            break
+    
+    # Skip if not supported on this platform
+    if video_type and not is_video_supported(video_type):
+        decky_plugin.logger.info(f'Skipping {video_type} animation on {platform.system()} (not supported)')
+        return
+    
+    # On Windows, check if uioverrides works, otherwise use steamui/movies directly
+    use_steamui = False
+    if platform.system() == 'Windows' and STEAMUI_MOVIES_PATH:
+        # Windows Steam doesn't check uioverrides by default, use steamui/movies
+        target_path = os.path.join(STEAMUI_MOVIES_PATH, video)
+        use_steamui = True
+        # Create backup if it doesn't exist
+        backup_path = target_path + '.backup'
+        if not os.path.exists(backup_path) and os.path.exists(target_path):
+            try:
+                shutil.copy2(target_path, backup_path)
+                decky_plugin.logger.info(f'Created backup: {backup_path}')
+            except Exception as e:
+                decky_plugin.logger.warning(f'Failed to create backup: {backup_path}', exc_info=e)
+    else:
+        # Linux/SteamOS uses uioverrides
+        target_path = os.path.join(OVERRIDE_PATH, video)
     
     # Remove existing file/symlink if it exists
-    if os.path.islink(override_path) or os.path.exists(override_path):
+    if os.path.islink(target_path) or os.path.exists(target_path):
         try:
-            os.remove(override_path)
+            os.remove(target_path)
         except Exception as e:
-            decky_plugin.logger.warning(f'Failed to remove existing override: {override_path}', exc_info=e)
+            decky_plugin.logger.warning(f'Failed to remove existing file: {target_path}', exc_info=e)
 
     if anim_id == '':
+        # Restore backup on Windows if reverting to default
+        if use_steamui:
+            backup_path = target_path + '.backup'
+            if os.path.exists(backup_path):
+                try:
+                    shutil.copy2(backup_path, target_path)
+                    decky_plugin.logger.info(f'Restored from backup: {target_path}')
+                except Exception as e:
+                    decky_plugin.logger.error(f'Failed to restore backup: {backup_path}', exc_info=e)
         return
 
     path = None
@@ -266,18 +359,19 @@ def apply_animation(video, anim_id):
 
     # Try to create symlink, fallback to copy on Windows if symlink fails
     try:
-        os.symlink(path, override_path)
+        os.symlink(path, target_path)
+        decky_plugin.logger.info(f'Created symlink: {target_path} -> {path}')
     except (OSError, NotImplementedError) as e:
         # On Windows, symlinks require admin privileges or Developer Mode
         # Fall back to copying the file instead
-        if platform.system() == 'Windows':
+        if platform.system() == 'Windows' or use_steamui:
             try:
-                decky_plugin.logger.info(f'Symlink failed, copying file instead: {path} -> {override_path}')
-                shutil.copy2(path, override_path)
+                decky_plugin.logger.info(f'Symlink failed, copying file instead: {path} -> {target_path}')
+                shutil.copy2(path, target_path)
             except Exception as copy_error:
-                raise_and_log(f'Failed to copy animation file: {path} -> {override_path}', copy_error)
+                raise_and_log(f'Failed to copy animation file: {path} -> {target_path}', copy_error)
         else:
-            raise_and_log(f'Failed to create symlink: {path} -> {override_path}', e)
+            raise_and_log(f'Failed to create symlink: {path} -> {target_path}', e)
 
 
 def apply_animations():
@@ -299,12 +393,22 @@ def remove_custom_animation(anim_id):
 
 def randomize_current_set():
     active = get_active_sets()
-    new_set = {'boot': '', 'suspend': '', 'throbber': ''}
     if len(active) > 0:
         new_set = active[random.randint(0, len(active) - 1)]
         config['current_set'] = new_set['id']
-    for i in range(3):
-        config[VIDEO_TYPES[i]] = new_set[VIDEO_TYPES[i]]['id']
+        for i in range(3):
+            # new_set[VIDEO_TYPES[i]] contains a filename, need to build the full animation ID
+            filename = new_set[VIDEO_TYPES[i]]
+            if filename:
+                # Build full animation ID: 'set_id/filename'
+                config[VIDEO_TYPES[i]] = f"{new_set['id']}/{filename}"
+            else:
+                config[VIDEO_TYPES[i]] = ''
+    else:
+        # No active sets, clear all animations
+        config['current_set'] = ''
+        for i in range(3):
+            config[VIDEO_TYPES[i]] = ''
 
 
 def randomize_all():
@@ -493,12 +597,18 @@ class Plugin:
 
     async def _main(self):
         decky_plugin.logger.info('Initializing...')
+        decky_plugin.logger.info(f'Platform: {platform.system()}')
+        decky_plugin.logger.info(f'Steam root: {STEAM_ROOT}')
+        decky_plugin.logger.info(f'Override path: {OVERRIDE_PATH}')
+        decky_plugin.logger.info(f'SteamUI movies path: {STEAMUI_MOVIES_PATH}')
 
         try:
             os.makedirs(ANIMATIONS_PATH, exist_ok=True)
-            os.makedirs(OVERRIDE_PATH, exist_ok=True)
+            if OVERRIDE_PATH:
+                os.makedirs(OVERRIDE_PATH, exist_ok=True)
             os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
             os.makedirs(DOWNLOADS_PATH, exist_ok=True)
+            decky_plugin.logger.info('Plugin directories created successfully')
         except Exception as e:
             decky_plugin.logger.error('Failed to make plugin directories', exc_info=e)
             raise e
