@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import random
+import shutil
 import socket
 import ssl
 import aiohttp
@@ -13,7 +15,31 @@ import decky_plugin
 CONFIG_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR, 'config.json')
 ANIMATIONS_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_RUNTIME_DIR, 'animations')
 DOWNLOADS_PATH = os.path.join(decky_plugin.DECKY_PLUGIN_RUNTIME_DIR, 'downloads')
-OVERRIDE_PATH = os.path.expanduser('~/.steam/root/config/uioverrides/movies')
+
+# Detect platform and set appropriate Steam override path
+def get_steam_override_path():
+    system = platform.system()
+    if system == 'Linux':
+        return os.path.expanduser('~/.steam/root/config/uioverrides/movies')
+    elif system == 'Windows':
+        # Try common Steam installation locations on Windows
+        possible_paths = [
+            os.path.expanduser('~\\AppData\\Local\\Steam\\config\\uioverrides\\movies'),
+            'C:\\Program Files (x86)\\Steam\\config\\uioverrides\\movies',
+            'C:\\Program Files\\Steam\\config\\uioverrides\\movies'
+        ]
+        # Check if Steam is installed via registry or common paths
+        for path in possible_paths:
+            parent = os.path.dirname(path)
+            if os.path.exists(parent):
+                return path
+        # Default to user's local AppData
+        return os.path.expanduser('~\\AppData\\Local\\Steam\\config\\uioverrides\\movies')
+    else:
+        # Fallback for other platforms (macOS, etc.)
+        return os.path.expanduser('~/Library/Application Support/Steam/config/uioverrides/movies')
+
+OVERRIDE_PATH = get_steam_override_path()
 
 BOOT_VIDEO = 'deck_startup.webm'
 SUSPEND_VIDEO = 'steam_os_suspend.webm'
@@ -84,7 +110,7 @@ async def regenerate_downloads():
     downloads = []
     if len(animation_cache) == 0:
         await update_cache()
-    for file in os.listdir():
+    for file in os.listdir(DOWNLOADS_PATH):
         if not file.endswith('.webm'):
             continue
         anim_id = file[:-5]
@@ -156,7 +182,7 @@ def load_local_animations():
     directories = next(os.walk(ANIMATIONS_PATH))[1]
     for directory in directories:
         is_set = False
-        config_path = f'{ANIMATIONS_PATH}/{directory}/config.json'
+        config_path = os.path.join(ANIMATIONS_PATH, directory, 'config.json')
         anim_config = {}
         if os.path.exists(config_path):
             try:
@@ -167,7 +193,7 @@ def load_local_animations():
                 decky_plugin.logger.warning(f'Failed to parse config.json for: {directory}', exc_info=e)
         else:
             for video in [BOOT_VIDEO, SUSPEND_VIDEO, THROBBER_VIDEO]:
-                if os.path.exists(f'{ANIMATIONS_PATH}/{directory}/{video}'):
+                if os.path.exists(os.path.join(ANIMATIONS_PATH, directory, video)):
                     is_set = True
                     break
         if not is_set:
@@ -180,7 +206,7 @@ def load_local_animations():
 
         def process_animation(default, anim_type, target):
             filename = default if anim_type not in anim_config else anim_config[anim_type]
-            if anim_type not in anim_config and not os.path.exists(f'{ANIMATIONS_PATH}/{directory}/{filename}'):
+            if anim_type not in anim_config and not os.path.exists(os.path.join(ANIMATIONS_PATH, directory, filename)):
                 filename = ''
             local_set[anim_type] = filename
             if filename != '' and filename is not None:
@@ -207,9 +233,14 @@ def find_cached_animation(anim_id):
 
 
 def apply_animation(video, anim_id):
-    override_path = f'{OVERRIDE_PATH}/{video}'
+    override_path = os.path.join(OVERRIDE_PATH, video)
+    
+    # Remove existing file/symlink if it exists
     if os.path.islink(override_path) or os.path.exists(override_path):
-        os.remove(override_path)
+        try:
+            os.remove(override_path)
+        except Exception as e:
+            decky_plugin.logger.warning(f'Failed to remove existing override: {override_path}', exc_info=e)
 
     if anim_id == '':
         return
@@ -217,7 +248,7 @@ def apply_animation(video, anim_id):
     path = None
     for anim in config['downloads']:
         if anim['id'] == anim_id:
-            path = f'{DOWNLOADS_PATH}/{anim_id}.webm'
+            path = os.path.join(DOWNLOADS_PATH, f'{anim_id}.webm')
             break
     else:
         for anim in config['custom_animations']:
@@ -227,13 +258,26 @@ def apply_animation(video, anim_id):
         else:
             for anim in local_animations:
                 if anim['id'] == anim_id:
-                    path = ANIMATIONS_PATH + '/' + anim_id
+                    path = os.path.join(ANIMATIONS_PATH, anim_id)
                     break
 
     if path is None or not os.path.exists(path):
         raise_and_log(f'Failed to find animation for: {anim_id}')
 
-    os.symlink(path, override_path)
+    # Try to create symlink, fallback to copy on Windows if symlink fails
+    try:
+        os.symlink(path, override_path)
+    except (OSError, NotImplementedError) as e:
+        # On Windows, symlinks require admin privileges or Developer Mode
+        # Fall back to copying the file instead
+        if platform.system() == 'Windows':
+            try:
+                decky_plugin.logger.info(f'Symlink failed, copying file instead: {path} -> {override_path}')
+                shutil.copy2(path, override_path)
+            except Exception as copy_error:
+                raise_and_log(f'Failed to copy animation file: {path} -> {override_path}', copy_error)
+        else:
+            raise_and_log(f'Failed to create symlink: {path} -> {override_path}', e)
 
 
 def apply_animations():
@@ -324,7 +368,8 @@ class Plugin:
             for entry in local_sets:
                 if entry['id'] == set_id:
                     entry['enable'] = enable
-                    with open(f'{ANIMATIONS_PATH}/{entry["name"]}/config.json', 'w') as f:
+                    config_file = os.path.join(ANIMATIONS_PATH, entry['id'], 'config.json')
+                    with open(config_file, 'w') as f:
                         json.dump(entry, f)
                     return
             for entry in config['custom_sets']:
@@ -387,12 +432,13 @@ class Plugin:
                     return
             async with aiohttp.ClientSession(connector=TCPConnector(family=socket.AF_INET) if config['force_ipv4'] else None) as web:
                 if (anim := find_cached_animation(anim_id)) is None:
-                    raise_and_log(f'Failed to find cached animation with id: {id}')
+                    raise_and_log(f'Failed to find cached animation with id: {anim_id}')
                 async with web.get(anim['download_url'], ssl=ssl_ctx) as response:
                     if response.status != 200:
                         raise_and_log(f'Invalid download request status: {response.status}')
                     data = await response.read()
-            with open(f'{DOWNLOADS_PATH}/{anim_id}.webm', 'wb') as f:
+            download_file = os.path.join(DOWNLOADS_PATH, f'{anim_id}.webm')
+            with open(download_file, 'wb') as f:
                 f.write(data)
             config['downloads'].append(anim)
             save_config()
@@ -405,7 +451,9 @@ class Plugin:
         try:
             config['downloads'] = [entry for entry in config['downloads'] if entry['id'] != anim_id]
             save_config()
-            os.remove(f'{DOWNLOADS_PATH}/{anim_id}.webm')
+            anim_file = os.path.join(DOWNLOADS_PATH, f'{anim_id}.webm')
+            if os.path.exists(anim_file):
+                os.remove(anim_file)
         except Exception as e:
             decky_plugin.logger.error('Failed to delete animation', exc_info=e)
             raise e
